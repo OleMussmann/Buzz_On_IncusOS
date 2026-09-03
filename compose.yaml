@@ -1,0 +1,307 @@
+name: buzz
+
+# Adapted from block/buzz's own deploy/compose/compose.yml (the single-node
+# production bundle) for incus-compose. The upstream file is the source of
+# truth; see "Keeping this in sync with upstream" in README.md for what was
+# changed and why.
+
+x-common-service: &common-service
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+      compress: "true"
+
+services:
+  postgres:
+    <<: *common-service
+    # Tag is literal, digest is the managed pin. The literal major version is
+    # deliberate: a major Postgres upgrade needs pg_upgrade or a dump/restore,
+    # so it must be an explicit edit here, never something `apply-all` can do.
+    # An earlier `tag_re: '^1[7-9]-alpine$'` let the updater offer 17->18 as a
+    # routine bump — which would have recreated the container against an
+    # incompatible data directory.
+    image: docker.io/postgres:18-alpine@${POSTGRES_DIGEST}
+    x-update:
+      mode: digest
+      volume: vol-pgdata
+      version_cmd: [postgres, --version]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-buzz}
+      POSTGRES_USER: ${POSTGRES_USER:-buzz}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      # PGDATA deliberately NOT set. Upstream's bundle pins it to
+      # /var/lib/postgresql/data/pgdata, which is a PG17-and-earlier layout.
+      # PG18 changed both: VOLUME moved up a level to /var/lib/postgresql and
+      # the default PGDATA became /var/lib/postgresql/18/docker — a
+      # major-version-scoped subdirectory. Letting the image supply its own
+      # default keeps this correct without hardcoding "18" in a second place.
+      # incus-compose gives the entrypoint a TTY, so psql running the initdb
+      # scripts pipes its output into `less` and blocks forever — initdb then
+      # never finishes, with no error, just a hang. Same trap as the search
+      # stack's nuq-postgres. Load-bearing, do not remove.
+      PSQL_PAGER: cat
+    volumes:
+      # Mount at /var/lib/postgresql, NOT /var/lib/postgresql/data. That path
+      # does not exist in the PG18 image, and Incus cannot create a missing
+      # nested mount target — the container dies at spawn with
+      # `Failed to open target mountpoint /var/lib/postgresql/data for
+      # detached idmapped mount`, which incus-compose surfaces as an
+      # unrelated-looking "volume configuration mismatch: UID mismatch".
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-buzz} -d $${POSTGRES_DB:-buzz}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      # Generous vs upstream's 10s: ic-healthd latches the first failed probe
+      # into `unhealthy` and never re-probes, and `relay` gates on this being
+      # healthy. A short start_period risks a permanent false negative.
+      start_period: 60s
+    cpus: 2.0
+    mem_limit: 2G
+    memswap_limit: 2G
+
+  redis:
+    <<: *common-service
+    image: docker.io/redis:7-alpine@${REDIS_DIGEST}
+    x-update:
+      mode: digest
+      volume: vol-redisdata
+      version_cmd: [redis-server, --version]
+    restart: unless-stopped
+    # NO leading `redis-server` here, unlike upstream. incus-compose APPENDS
+    # `command:` to the image's entrypoint *and* its CMD, where Docker Compose
+    # would have `command:` REPLACE the CMD. The image already resolves to
+    # `docker-entrypoint.sh redis-server`, so repeating it yields
+    # `redis-server redis-server --appendonly ...` — and redis reads that
+    # second word as a config-file path, dying with
+    # `Fatal error, can't open config file '/data/redis-server'`.
+    # Passing only flags is also correct under plain Docker: redis's
+    # entrypoint prepends `redis-server` when the first argument starts with
+    # `-`, so this stays portable in both directions.
+    command: ["--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    mem_limit: 512M
+    memswap_limit: 512M
+
+  minio:
+    <<: *common-service
+    # Literal pin, deliberately matching upstream's own pin rather than
+    # tracking MinIO releases independently — Buzz tests against this one.
+    # No x-update block: bumping it is an upstream-follow decision, not a
+    # registry-freshness decision.
+    image: docker.io/minio/minio:${MINIO_TAG}
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${BUZZ_S3_ACCESS_KEY:?set BUZZ_S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${BUZZ_S3_SECRET_KEY:?set BUZZ_S3_SECRET_KEY}
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    cpus: 2.0
+    mem_limit: 2G
+    memswap_limit: 2G
+
+  # Creates the media bucket, makes sure it is not public, then STAYS RUNNING
+  # as an idle guard.
+  #
+  # Upstream runs this as a one-shot and has `relay` gate on it with
+  # `service_completed_successfully`. That condition is NOT honoured by
+  # incus-compose: it reports the one-shot as started, never waits for it to
+  # exit, and the dependent service starts immediately. Measured on a fresh
+  # deploy, `relay` probed the bucket 8.9s before this container created it and
+  # died with `NoSuchBucket`.
+  #
+  # `condition: service_healthy` IS honoured, so the fix is to give this
+  # container a healthcheck that asserts the bucket exists and keep it alive
+  # long enough to be probed. It costs one idle container; the alternative is a
+  # deploy that reliably fails once and needs the relay started by hand.
+  minio-init:
+    <<: *common-service
+    image: docker.io/minio/mc:${MINIO_MC_TAG}
+    entrypoint: ["/bin/sh", "-euc"]
+    # Single-element list, NOT a folded `>` string. `sh -euc` takes the whole
+    # script as one argument; compose splits a bare string command on
+    # whitespace, which silently truncated this at the first `&&` and left
+    # only `mc alias set ...` (caught by `incus-compose config`).
+    #
+    # `while :; do sleep 3600; done` rather than `sleep infinity`: busybox
+    # sleep doesn't accept `infinity` on every base image, and this image's
+    # base is not something to depend on.
+    command:
+      - >-
+        mc alias set local http://minio:9000 "$${BUZZ_S3_ACCESS_KEY}" "$${BUZZ_S3_SECRET_KEY}" &&
+        mc mb --ignore-existing "local/$${BUZZ_S3_BUCKET}" &&
+        mc anonymous set none "local/$${BUZZ_S3_BUCKET}" &&
+        while :; do sleep 3600; done
+    environment:
+      BUZZ_S3_ACCESS_KEY: ${BUZZ_S3_ACCESS_KEY:?set BUZZ_S3_ACCESS_KEY}
+      BUZZ_S3_SECRET_KEY: ${BUZZ_S3_SECRET_KEY:?set BUZZ_S3_SECRET_KEY}
+      BUZZ_S3_BUCKET: ${BUZZ_S3_BUCKET:-buzz-media}
+    depends_on:
+      minio:
+        condition: service_healthy
+    # Asserts the bucket is actually there — not merely that the script ran.
+    # Uses the alias written by `mc alias set` above, in this same container.
+    healthcheck:
+      test: ["CMD-SHELL", "mc ls \"local/$${BUZZ_S3_BUCKET}\" >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+    mem_limit: 256M
+    memswap_limit: 256M
+
+  relay:
+    <<: *common-service
+    # Digest of :main, NOT a ranked `sha-<7>` tag.
+    #
+    # No semver tags exist for this image (verified 2026-08-26: v0.5.2 and
+    # v0.4.26 both 404; the v*/desktop-v* GitHub releases publish no
+    # correspondingly-tagged relay image). The obvious alternative —
+    # `mode: tag, order: pushed` over `^sha-[0-9a-f]{7}$` — was tried and is
+    # WRONG here: it selected sha-001151e, an image built 2026-07-16, six
+    # weeks OLDER than the sha-822c5ab then pinned. The registry's push
+    # timestamps do not track build time for this repo (re-tag or backfill),
+    # so "newest pushed" is not "newest code". The downgrade was caught only
+    # because the older binary refused to run:
+    # `migration 20 was previously applied but is missing in the resolved
+    # migrations`.
+    #
+    # :main is rebuilt from HEAD, so its digest is always genuinely current.
+    # To recover the commit behind a digest, read the image's
+    # org.opencontainers.image.revision label — see README.
+    image: ghcr.io/block/buzz:main@${BUZZ_DIGEST}
+    # Run as container-root instead of the image's `buzz` user (uid 1000).
+    #
+    # incus-compose provisions custom volumes as `initial.uid=0,
+    # initial.gid=0, security.shifted=true` and refuses to start if an
+    # attached volume differs — `volume configuration mismatch: expected
+    # security.shifted=true / UID mismatch, expected 0 got 1000`. A
+    # hand-created uid-1000 volume is rejected, and a uid-0 one leaves the
+    # relay unable to write its own git tree:
+    # `BUZZ_GIT_PACK_CACHE_PATH=/data/git/.pack-cache could not be created:
+    # Permission denied`. Matching the relay to the volume is the only side
+    # of that standoff we control.
+    #
+    # Container-root is not host-root: Incus idmaps the container, so uid 0
+    # inside maps to an unprivileged host uid.
+    x-incus:
+      oci.uid: "0"
+      oci.gid: "0"
+    x-update:
+      mode: digest
+      volume: none
+      version_cmd: [buzz-relay, --version]
+    restart: unless-stopped
+    environment:
+      # Upstream delivers most of these via `env_file: .env`, which injects
+      # the whole file into the container. Expanded to explicit entries here
+      # so that what reaches the relay is visible in this file and rendered
+      # by `incus-compose config` — and so .env stays purely an
+      # interpolation source, as in the search stack.
+      BUZZ_BIND_ADDR: 0.0.0.0:3000
+      BUZZ_HEALTH_PORT: "8080"
+      BUZZ_METRICS_PORT: "9102"
+      DATABASE_URL: postgres://${POSTGRES_USER:-buzz}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-buzz}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379
+      BUZZ_S3_ENDPOINT: http://minio:9000
+      # Incus's per-project DNS resolves `minio`, not `<bucket>.minio` —
+      # path addressing is mandatory here, exactly as upstream notes for
+      # Docker DNS. Not configurable for an external S3 provider.
+      BUZZ_S3_ADDRESSING_STYLE: path
+      BUZZ_S3_ACCESS_KEY: ${BUZZ_S3_ACCESS_KEY:?set BUZZ_S3_ACCESS_KEY}
+      BUZZ_S3_SECRET_KEY: ${BUZZ_S3_SECRET_KEY:?set BUZZ_S3_SECRET_KEY}
+      BUZZ_S3_BUCKET: ${BUZZ_S3_BUCKET:-buzz-media}
+      BUZZ_GIT_REPO_PATH: /data/git
+      # Identity and access. RELAY_OWNER_PUBKEY is deliberately un-prefixed
+      # upstream; it must be 64-char hex, and the owner cannot be removed
+      # later, so get it right before the first `up`.
+      RELAY_OWNER_PUBKEY: ${RELAY_OWNER_PUBKEY:?set RELAY_OWNER_PUBKEY}
+      BUZZ_RELAY_PRIVATE_KEY: ${BUZZ_RELAY_PRIVATE_KEY:?set BUZZ_RELAY_PRIVATE_KEY}
+      BUZZ_GIT_HOOK_HMAC_SECRET: ${BUZZ_GIT_HOOK_HMAC_SECRET:?set BUZZ_GIT_HOOK_HMAC_SECRET}
+      # Must match byte-for-byte what clients connect with, scheme included.
+      RELAY_URL: ${RELAY_URL:?set RELAY_URL}
+      BUZZ_MEDIA_BASE_URL: ${BUZZ_MEDIA_BASE_URL:?set BUZZ_MEDIA_BASE_URL}
+      BUZZ_MEDIA_SERVER_DOMAIN: ${BUZZ_MEDIA_SERVER_DOMAIN:?set BUZZ_MEDIA_SERVER_DOMAIN}
+      BUZZ_CORS_ORIGINS: ${BUZZ_CORS_ORIGINS:?set BUZZ_CORS_ORIGINS}
+      # Closed-relay mode: only registered members may connect.
+      BUZZ_REQUIRE_AUTH_TOKEN: ${BUZZ_REQUIRE_AUTH_TOKEN:-true}
+      BUZZ_REQUIRE_RELAY_MEMBERSHIP: ${BUZZ_REQUIRE_RELAY_MEMBERSHIP:-true}
+      BUZZ_ALLOW_NIP_OA_AUTH: ${BUZZ_ALLOW_NIP_OA_AUTH:-true}
+      # Runs embedded SQLx migrations on boot. Needed to bootstrap a fresh
+      # database; the alternative is `buzz-admin migrate` before first start.
+      BUZZ_AUTO_MIGRATE: ${BUZZ_AUTO_MIGRATE:-true}
+      BUZZ_GIT_CONFORMANCE_PROBE: ${BUZZ_GIT_CONFORMANCE_PROBE:-true}
+      RUST_LOG: ${RUST_LOG:-buzz_relay=info,buzz_db=info,buzz_auth=info,buzz_pubsub=info,tower_http=info}
+    volumes:
+      - gitdata:/data/git
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      # service_healthy, NOT service_completed_successfully — see the comment
+      # on minio-init. The completion condition does not block in
+      # incus-compose, which let the relay race ahead of bucket creation.
+      minio-init:
+        condition: service_healthy
+    # Probes /_readiness on the health port over bash's /dev/tcp — the runtime
+    # image ships bash but neither curl nor wget.
+    #
+    # RISK, read before trusting this: ic-healthd latches the first failed
+    # probe into `unhealthy` and never re-probes, and `restart: unless-stopped`
+    # means a permanently-failing probe becomes a restart loop rather than a
+    # passive red light. First boot runs migrations, so start_period is 120s
+    # (upstream uses 30s, which assumes Docker's re-probing behaviour).
+    # Nothing depends on this healthcheck — if it latches, delete the block.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8080; printf \"GET /_readiness HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n\" >&3; grep -q \"200 OK\" <&3'",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 120s
+    # Ports published via compose.incus.yaml only (Tailscale-scoped + NAT).
+    # Declaring them here as well would merge with the overlay's entries and
+    # produce duplicate proxy-<port> devices that collide on device name —
+    # the trap the search stack hit when it flipped to NAT mode.
+    cpus: 4.0
+    mem_limit: 4G
+    memswap_limit: 4G
+
+# No `networks:` block. Upstream declares a `buzz-net` bridge because Docker
+# Compose otherwise puts everything on the default bridge; incus-compose
+# instead creates a dedicated bridge per compose project automatically
+# (`incus network list` shows one `ic-*` bridge per stack). Declaring
+# networks here would create a second, redundant bridge.
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  gitdata:
