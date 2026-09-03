@@ -29,8 +29,8 @@ services:
         host_ip: "IncusOS_IP_ADDRESS"
         x-incus-compose:
           nat: true
-      # 9102 — Prometheus metrics. Published for the "monitor system metrics,
-      # replace dashboard" task in the vault's ai-stack/tasks.md.
+      # 9102 — Prometheus metrics, for scraping by an external monitoring
+      # stack. Safe to delete this entry if nothing scrapes the relay.
       - published: "9102"
         target: "9102"
         host_ip: "IncusOS_IP_ADDRESS"
