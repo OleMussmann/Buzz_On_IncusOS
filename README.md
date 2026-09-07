@@ -587,6 +587,102 @@ Snapshot Postgres and the object/git volumes from the **same maintenance window*
 Postgres dump paired with a later media snapshot will reference blobs that the dump doesn't
 know about.
 
-Volume-level protection is handled by the host's ZFS snapshot schedule rather than by
-anything in this repo. `.env` is *not* covered by that — it lives only on your client
-machine, and it holds the relay and owner private keys. Back it up separately.
+### Backups are host-side — this repo makes none
+
+**Nothing here creates a snapshot.** There is no `snapshots.*` key in `compose.yaml`, no
+cron unit, no `x-` extension that sets one up. Deploying this stack gives you **no** data
+protection until you arrange it on the Incus host yourself, and `down --volumes` is then
+unrecoverable.
+
+Both options below cover the four volumes above. Option B is the better fit for this stack,
+because it snapshots them together.
+
+Names on the host are not the names in `compose.yaml`: incus-compose prefixes each volume
+with `vol-`, and the Incus project is `buzz` — taken from `compose.yaml`'s `name:` key, not
+from the directory. Volumes the image declares itself, rather than this file, show up as
+`vol-auto-<service>-<path>`.
+
+Every `incus` command below needs to be pointed at the right project. Running them as
+`incus-compose incus <args>` does that for you; plain `incus` needs an explicit `--project`.
+Substitute your own storage pool for `<pool>` (`incus storage list` — commonly `default`).
+
+#### Option A — let Incus snapshot each volume on a schedule
+
+Incus can do this on its own, on any storage driver: ZFS and btrfs give cheap copy-on-write
+snapshots, LVM thin snapshots, and the `dir` driver falls back to a full copy.
+
+```
+incus-compose incus storage volume set <pool> vol-pgdata \
+  snapshots.schedule=@daily \
+  snapshots.expiry=4w
+```
+
+Then check what a volume actually carries, and what has been taken:
+
+```
+incus-compose incus storage volume show <pool> vol-pgdata
+incus-compose incus storage volume snapshot list <pool> vol-pgdata
+```
+
+Two behaviours here cost more time than they should:
+
+- **`@daily` is not midnight, and not the same moment for every volume.** Incus expands it
+  to `<minute> <hour> * * *`, where both fields are a *stable pseudo-random* value derived
+  from the volume's internal database id — deliberate load-spreading, "scheduled time
+  obfuscation" in the upstream source. So each volume fires once a day at its own fixed but
+  arbitrary time, and after you set a schedule it can take a full 24 h before every volume
+  has a first snapshot. An empty `snapshot list` an hour after setup is expected, not a
+  fault. If you need a predictable window, give a cron expression instead of the alias:
+  `snapshots.schedule="30 3 * * *"`.
+- **Expiry units are case-sensitive.** `S`econds, `M`inutes, `H`ours, `d`ays, `w`eeks,
+  `m`onths, `y`ears — `2m` is two months, `2M` is two minutes. `snapshots.expiry` applies to
+  hand-taken snapshots too, unless you pass `--no-expiry`.
+
+#### Option B — `incus-compose backup`
+
+incus-compose can snapshot a project's data volumes into a separate backup project in one
+pass, which is the easier answer when several volumes have to be consistent with one another
+— exactly the maintenance-window problem described above:
+
+```
+incus-compose backup create --name pre-upgrade
+incus-compose backup list
+incus-compose backup verify <timestamp>
+incus-compose backup restore <timestamp>
+incus-compose backup delete --keep-last 7
+```
+
+It has no scheduler of its own — drive it from cron or a systemd timer. `--live` snapshots
+without stopping anything, which buys you a crash-consistent copy rather than a clean one.
+See `incus-compose backup --help`.
+
+#### Taking and restoring one by hand
+
+Worth doing before any upgrade, whichever option you run:
+
+```
+incus-compose incus storage volume snapshot create <pool> vol-pgdata pre-upgrade
+```
+
+Restoring needs the volume idle — a custom volume in use by a running instance cannot be
+rolled back, so stop the stack first:
+
+```
+incus-compose down
+incus-compose incus storage volume snapshot restore <pool> vol-pgdata pre-upgrade
+incus-compose up -d
+```
+
+#### Snapshots are not backups
+
+They live on the same pool as the data they protect. A dead disk, a destroyed pool or a
+mistaken `incus project delete` takes both. For anything you would genuinely miss, get a
+copy off the host:
+
+```
+incus-compose incus storage volume export <pool> vol-pgdata volume.tar.gz
+incus-compose incus storage volume copy <pool>/vol-pgdata <remote>:<pool>/vol-pgdata
+```
+
+`.env` is *not* covered by any of this — it lives only on your client machine, and it holds
+the relay and owner private keys. Back it up separately.
