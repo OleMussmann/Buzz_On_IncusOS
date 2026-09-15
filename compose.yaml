@@ -28,6 +28,11 @@ services:
       volume: vol-pgdata
       version_cmd: [postgres, --version]
     restart: unless-stopped
+    x-incus:
+      # Slow starter that relay hard-depends on: ordered ahead of the
+      # rest so it has a head start on accepting connections.
+      boot.autostart.priority: "90"
+      boot.autorestart: "true"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-buzz}
       POSTGRES_USER: ${POSTGRES_USER:-buzz}
@@ -72,6 +77,10 @@ services:
       volume: vol-redisdata
       version_cmd: [redis-server, --version]
     restart: unless-stopped
+    x-incus:
+      # Backing store, no dependencies of its own.
+      boot.autostart.priority: "100"
+      boot.autorestart: "true"
     # NO leading `redis-server` here, unlike upstream. incus-compose APPENDS
     # `command:` to the image's entrypoint *and* its CMD, where Docker Compose
     # would have `command:` REPLACE the CMD. The image already resolves to
@@ -104,6 +113,10 @@ services:
     # registry-freshness decision.
     image: docker.io/minio/minio:${MINIO_TAG}
     restart: unless-stopped
+    x-incus:
+      # Backing store, no dependencies of its own.
+      boot.autostart.priority: "100"
+      boot.autorestart: "true"
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${BUZZ_S3_ACCESS_KEY:?set BUZZ_S3_ACCESS_KEY}
@@ -168,6 +181,11 @@ services:
       retries: 30
       start_period: 30s
     restart: unless-stopped
+    x-incus:
+      # Creates the bucket, then idles so relay can gate on it.
+      # Long-running by design (sleep loop), so a watchdog is correct here.
+      boot.autostart.priority: "50"
+      boot.autorestart: "true"
     mem_limit: 256M
     memswap_limit: 256M
 
@@ -208,6 +226,9 @@ services:
     x-incus:
       oci.uid: "0"
       oci.gid: "0"
+      # The application. Starts last.
+      boot.autostart.priority: "10"
+      boot.autorestart: "true"
     x-update:
       mode: digest
       volume: none
