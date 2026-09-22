@@ -226,14 +226,20 @@ services:
     # Container-root is not host-root: Incus idmaps the container, so uid 0
     # inside maps to an unprivileged host uid.
     #
-    # `user:`, NOT `x-incus: oci.uid/oci.gid`. incus-compose 1.3 derives the
-    # owner it expects on a shifted volume from `user:`, falling back to the
-    # image's USER — it never looks at oci.uid. With only the x-incus override
-    # the volume is checked against `buzz` (1000) and every stack-wide `up`
-    # fails with `UID mismatch, expected 1000 got 0`. `user:` sets
-    # oci.uid/oci.gid as well, so it is the one knob.
+    # Both `user:` AND `x-incus: oci.uid/oci.gid` are required; each covers
+    # what the other misses in incus-compose 1.3:
+    #   - `user:` sets the owner expected on a shifted volume. Without it the
+    #     volume is checked against the image's USER (`buzz`, 1000) and every
+    #     stack-wide `up` fails with `UID mismatch, expected 1000 got 0`.
+    #   - `oci.uid/oci.gid` set the uid the process runs as. The image's USER
+    #     is a name, which incus-compose records as uid 0, and it only writes
+    #     oci.uid when the requested owner differs from that — so `user: "0:0"`
+    #     alone writes nothing, Incus resolves `buzz` itself, and the relay
+    #     runs as 1000 and panics on `/data/git/.pack-cache: Permission denied`.
     user: "0:0"
     x-incus:
+      oci.uid: "0"
+      oci.gid: "0"
       # The application. Starts last.
       boot.autostart.priority: "10"
       boot.autorestart: "true"

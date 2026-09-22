@@ -408,12 +408,15 @@ doesn't obviously point at its cause.
   shows as stopped. A hand-created uid-1000 volume is rejected outright; a uid-0 one leaves
   an image that runs as a non-root user unable to write its own data
   (`/data/git/.pack-cache could not be created: Permission denied`). The relay image runs as
-  `buzz` (uid 1000), so this stack pins it to container-root via `user: "0:0"` — matching
-  the relay to the volume is the only side of the standoff you control. Container-root is
-  not host-root; Incus idmaps it. It must be `user:`, not `x-incus: {oci.uid, oci.gid}`:
-  from incus-compose 1.3 the expected volume owner comes from `user:` or the image's USER
-  and ignores oci.uid, so the x-incus form fails the other way round (`UID mismatch,
-  expected 1000 got 0`).
+  `buzz` (uid 1000), so this stack pins it to container-root — matching the relay to the
+  volume is the only side of the standoff you control. Container-root is not host-root;
+  Incus idmaps it. Under incus-compose 1.3 this takes **both** `user: "0:0"` and
+  `x-incus: {oci.uid: "0", oci.gid: "0"}`. `user:` sets the owner expected on the volume
+  (otherwise it is the image's USER, and `up` fails with `UID mismatch, expected 1000 got
+  0`). `oci.uid/gid` set the uid the process runs as: the image's USER is a name, which
+  incus-compose records as uid 0, so `user: "0:0"` looks like "no change" and writes no
+  oci.uid — Incus then resolves `buzz` itself and the relay panics on
+  `/data/git/.pack-cache: Permission denied`.
 - **Postgres 18 moved its data directory.** `VOLUME` went from
   `/var/lib/postgresql/data` (PG17) up a level to `/var/lib/postgresql`, and the default
   `PGDATA` became `/var/lib/postgresql/18/docker` — a major-version-scoped subdirectory.
@@ -516,7 +519,7 @@ Deliberate divergences from upstream, so a diff doesn't re-litigate them each ti
 | no `PSQL_PAGER` | `PSQL_PAGER: cat` | incus-compose gives the entrypoint a TTY |
 | `BUZZ_IMAGE` env var | `BUZZ_DIGEST` in `versions.env` | Matches the pinning scheme used across these stacks |
 | `postgres:17-alpine`, `PGDATA=…/data/pgdata`, volume at `…/postgresql/data` | `postgres:18-alpine`, `PGDATA` unset, volume at `/var/lib/postgresql` | PG18 relocated both; upstream's paths are PG17-era |
-| relay runs as image default (`buzz`, uid 1000) | `user: "0:0"` | incus-compose provisions volumes root-owned and rejects anything else |
+| relay runs as image default (`buzz`, uid 1000) | `user: "0:0"` + `x-incus: oci.uid/gid = 0` | incus-compose provisions volumes root-owned and rejects anything else |
 
 ### Image pinning
 
