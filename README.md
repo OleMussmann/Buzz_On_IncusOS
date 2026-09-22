@@ -15,8 +15,8 @@ Agents connect to it from wherever they run.
 |---|---|---|
 | `postgres` | `docker.io/postgres:17-alpine` | Event store + full-text search |
 | `redis` | `docker.io/redis:7-alpine` | Pub/sub fan-out between relay connections |
-| `minio` | `docker.io/minio/minio` | S3-compatible object store for media (Blossom protocol) |
-| `minio-init` | `docker.io/minio/mc` | One-shot: creates the media bucket, ensures it is not public, then exits |
+| `minio` | `quay.io/minio/minio` | S3-compatible object store for media (Blossom protocol) |
+| `minio-init` | `quay.io/minio/mc` | One-shot: creates the media bucket, ensures it is not public, then exits |
 | `relay` | `ghcr.io/block/buzz` | The relay itself — WebSocket (Nostr), REST API, web UI, git hosting |
 
 Only `relay` is reachable from outside the Incus project, and only over Tailscale.
@@ -408,9 +408,12 @@ doesn't obviously point at its cause.
   shows as stopped. A hand-created uid-1000 volume is rejected outright; a uid-0 one leaves
   an image that runs as a non-root user unable to write its own data
   (`/data/git/.pack-cache could not be created: Permission denied`). The relay image runs as
-  `buzz` (uid 1000), so this stack pins it to container-root via
-  `x-incus: {oci.uid: "0", oci.gid: "0"}` — matching the relay to the volume is the only
-  side of the standoff you control. Container-root is not host-root; Incus idmaps it.
+  `buzz` (uid 1000), so this stack pins it to container-root via `user: "0:0"` — matching
+  the relay to the volume is the only side of the standoff you control. Container-root is
+  not host-root; Incus idmaps it. It must be `user:`, not `x-incus: {oci.uid, oci.gid}`:
+  from incus-compose 1.3 the expected volume owner comes from `user:` or the image's USER
+  and ignores oci.uid, so the x-incus form fails the other way round (`UID mismatch,
+  expected 1000 got 0`).
 - **Postgres 18 moved its data directory.** `VOLUME` went from
   `/var/lib/postgresql/data` (PG17) up a level to `/var/lib/postgresql`, and the default
   `PGDATA` became `/var/lib/postgresql/18/docker` — a major-version-scoped subdirectory.
@@ -513,7 +516,7 @@ Deliberate divergences from upstream, so a diff doesn't re-litigate them each ti
 | no `PSQL_PAGER` | `PSQL_PAGER: cat` | incus-compose gives the entrypoint a TTY |
 | `BUZZ_IMAGE` env var | `BUZZ_DIGEST` in `versions.env` | Matches the pinning scheme used across these stacks |
 | `postgres:17-alpine`, `PGDATA=…/data/pgdata`, volume at `…/postgresql/data` | `postgres:18-alpine`, `PGDATA` unset, volume at `/var/lib/postgresql` | PG18 relocated both; upstream's paths are PG17-era |
-| relay runs as image default (`buzz`, uid 1000) | `x-incus: oci.uid/gid = 0` | incus-compose provisions volumes root-owned and rejects anything else |
+| relay runs as image default (`buzz`, uid 1000) | `user: "0:0"` | incus-compose provisions volumes root-owned and rejects anything else |
 
 ### Image pinning
 
@@ -541,19 +544,16 @@ silently runs a months-old relay.
 **`sha256-*` tags are not images either** — see the note above; they're Sigstore attestation
 bundles.
 
-**Ranking `sha-<7>` tags by push time is WRONG here — it was tried and it broke the stack.**
-The obvious scheme, `x-update: {mode: tag, order: pushed, tag_re: '^sha-[0-9a-f]{7}$'}`,
-selected `sha-001151e` — an image built **2026-07-16**, six weeks *older* than the
-`sha-822c5ab` it replaced. This registry's push timestamps do not track build time (re-tag
-or backfill), so "newest pushed" is not "newest code". The relay refused to start:
+**`sha-<7>` tags cannot be ranked.** A commit hash has no order of its own, and ghcr.io's
+tags API returns names only, with no push times — so `x-update: {order: pushed}` has nothing
+to sort by here. A wrong pick is a downgrade, and a downgrade is not harmless: an older relay
+refuses to start against a database migrated by a newer one:
 
 ```
 migration 20 was previously applied but is missing in the resolved migrations
 ```
 
-That error is the only reason the downgrade was caught — the older binary declined to run
-against a database its migration set no longer covered. Had the schema happened to be
-compatible, it would have silently run six-week-old code.
+and if the schema happens to be compatible, it silently runs old code.
 
 So every pin in `versions.env` is a **digest**, with the human-readable tag left literal in
 `compose.yaml` (`image:label@${DIGEST}`) — the same shape Search_Providers uses for

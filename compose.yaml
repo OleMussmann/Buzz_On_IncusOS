@@ -111,7 +111,12 @@ services:
     # tracking MinIO releases independently — Buzz tests against this one.
     # No x-update block: bumping it is an upstream-follow decision, not a
     # registry-freshness decision.
-    image: docker.io/minio/minio:${MINIO_TAG}
+    #
+    # quay.io, not docker.io: MinIO no longer publishes to Docker Hub (the
+    # repos are gone), while quay.io carries the same RELEASE tags. Against a
+    # missing registry repo incus-compose only warns and runs from its image
+    # cache, which a cache purge would leave unbuildable.
+    image: quay.io/minio/minio:${MINIO_TAG}
     restart: unless-stopped
     x-incus:
       # Backing store, no dependencies of its own.
@@ -149,7 +154,8 @@ services:
   # deploy that reliably fails once and needs the relay started by hand.
   minio-init:
     <<: *common-service
-    image: docker.io/minio/mc:${MINIO_MC_TAG}
+    # quay.io for the same reason as minio above.
+    image: quay.io/minio/mc:${MINIO_MC_TAG}
     entrypoint: ["/bin/sh", "-euc"]
     # Single-element list, NOT a folded `>` string. `sh -euc` takes the whole
     # script as one argument; compose splits a bare string command on
@@ -195,15 +201,11 @@ services:
     #
     # No semver tags exist for this image (verified 2026-08-26: v0.5.2 and
     # v0.4.26 both 404; the v*/desktop-v* GitHub releases publish no
-    # correspondingly-tagged relay image). The obvious alternative —
-    # `mode: tag, order: pushed` over `^sha-[0-9a-f]{7}$` — was tried and is
-    # WRONG here: it selected sha-001151e, an image built 2026-07-16, six
-    # weeks OLDER than the sha-822c5ab then pinned. The registry's push
-    # timestamps do not track build time for this repo (re-tag or backfill),
-    # so "newest pushed" is not "newest code". The downgrade was caught only
-    # because the older binary refused to run:
-    # `migration 20 was previously applied but is missing in the resolved
-    # migrations`.
+    # correspondingly-tagged relay image). The `sha-<7>` tags cannot be
+    # ranked either: a commit hash has no order of its own, and ghcr.io's
+    # tag list carries no push times, so `order: pushed` has nothing to sort
+    # by there. A downgrade matters here: an older relay refuses to start
+    # against a database migrated by a newer one.
     #
     # :main is rebuilt from HEAD, so its digest is always genuinely current.
     # To recover the commit behind a digest, read the image's
@@ -223,9 +225,15 @@ services:
     #
     # Container-root is not host-root: Incus idmaps the container, so uid 0
     # inside maps to an unprivileged host uid.
+    #
+    # `user:`, NOT `x-incus: oci.uid/oci.gid`. incus-compose 1.3 derives the
+    # owner it expects on a shifted volume from `user:`, falling back to the
+    # image's USER — it never looks at oci.uid. With only the x-incus override
+    # the volume is checked against `buzz` (1000) and every stack-wide `up`
+    # fails with `UID mismatch, expected 1000 got 0`. `user:` sets
+    # oci.uid/oci.gid as well, so it is the one knob.
+    user: "0:0"
     x-incus:
-      oci.uid: "0"
-      oci.gid: "0"
       # The application. Starts last.
       boot.autostart.priority: "10"
       boot.autorestart: "true"
