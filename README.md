@@ -76,13 +76,10 @@ the slash form directly with `incus launch` fails.
 
 ```
 .
-├── compose.yaml                  # Service definitions (Compose spec)
-├── compose.incus.yaml            # Incus-specific overrides — Tailscale-scoped ports
-│                                 # (gitignored, holds your real tailnet IP)
-├── compose.incus.yaml.example    # Template — copy and fill in
+├── compose.yaml                  # Service definitions (Compose spec), incl. Tailscale-scoped ports
 ├── versions.env                  # Image pins (tracked)
-├── .env.example                  # Template — copy to .env and fill in real secrets
-└── .env                          # Real secrets (gitignored — never commit)
+├── .env.example                  # Template — copy to .env and fill in real values
+└── .env                          # Real secrets and the tailnet IP (gitignored — never commit)
 ```
 
 ## Configuration
@@ -139,10 +136,11 @@ Pointing Buzz at a real external S3 provider is *not* configurable through `.env
 `compose.yaml`, matching upstream's own constraint. Upstream directs you to the Helm chart
 for that case.
 
-Copy `compose.incus.yaml.example` to `compose.incus.yaml` and replace
-`IncusOS_IP_ADDRESS` with your host's Tailscale IP. Binding to the Tailscale address
-specifically — rather than `0.0.0.0` — is what keeps the relay off the public internet and
-off the LAN, so don't drop the `host_ip` prefix.
+Set `TAILNET_IP` in `.env` to your host's Tailscale IP. All three published ports bind to
+that address specifically — rather than `0.0.0.0` — which is what keeps the relay off the
+public internet and off the LAN. `compose.yaml` reads it as `${TAILNET_IP:?...}`, so
+`config` and `up` refuse to run while it is unset or empty; an empty `host_ip` would
+otherwise bind every interface.
 
 All three port mappings use **long-form ports with `x-incus-compose.nat: true`** (kernel NAT
 proxy mode, incus-compose 1.1.0+), which is faster than the default userspace proxy.
@@ -368,11 +366,13 @@ doesn't obviously point at its cause.
 - **`PSQL_PAGER: cat` on `postgres` is load-bearing.** incus-compose gives the entrypoint a
   TTY, so `psql` running the initdb scripts pipes its output into `less` and blocks forever.
   Without it, initdb never finishes — with no error, just a hang.
-- **Don't declare the ports in `compose.yaml`.** Compose *merges* port lists across files
-  rather than replacing them, so declaring a port in both files produces two proxy devices
-  with the same name, and the userspace entry wins the collision — breaking start with
-  `Connect IP "127.0.0.1" must be one of the instance's static IPv4 addresses`. All three
-  ports are declared only in `compose.incus.yaml`.
+- **Ports live in `compose.yaml` only; don't add a `compose.incus.yaml`.** incus-compose
+  merges that file automatically whenever it exists, and Compose *merges* port lists across
+  files rather than replacing them, so declaring a port in both files produces two proxy
+  devices with the same name, and the userspace entry wins the collision — breaking start
+  with `Connect IP "127.0.0.1" must be one of the instance's static IPv4 addresses`.
+- **Port changes need `up`, not `restart`.** Proxy devices are written when the instance is
+  created or ensured; restarting an instance never adds or removes one.
 - **`command:` APPENDS to the image entrypoint; it does not replace the image's CMD.**
   This is the biggest behavioural difference from Docker Compose and it bites any service
   you override `command:` on. The redis image resolves to
@@ -513,7 +513,7 @@ Deliberate divergences from upstream, so a diff doesn't re-litigate them each ti
 | `name: buzz-prod` | `name: buzz` | Becomes the Incus project name |
 | `env_file: .env` on `relay` | Explicit `environment:` entries | `.env` stays purely an interpolation source, and `incus-compose config` renders what actually reaches the container |
 | `networks: buzz-net` | omitted | incus-compose creates one bridge per project |
-| `ports:` on `relay` | moved to `compose.incus.yaml` | Compose merges port lists; duplicates collide |
+| `ports:` on `relay` | long-form, `host_ip: ${TAILNET_IP:?}`, `nat: true` | Tailnet-only, kernel NAT proxy, refuses to render without the IP |
 | `entrypoint:` + folded string on `minio-init` | single-element `command:` list | Compose word-splits bare strings, truncating at `&&` |
 | relay `start_period: 30s` | `120s` | `ic-healthd` doesn't re-probe after a failure |
 | no `PSQL_PAGER` | `PSQL_PAGER: cat` | incus-compose gives the entrypoint a TTY |
