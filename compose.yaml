@@ -246,7 +246,13 @@ services:
     x-update:
       mode: digest
       volume: none
-      version_cmd: [buzz-relay, --version]
+      # Not `buzz-relay --version`: the binary has no such flag and ignores
+      # it, so that boots a second relay inside the running container — it
+      # loads config and only stops when the metrics port turns out to be
+      # taken. A checksum of the binary changes with every build and starts
+      # nothing. The commit behind a running digest is in the instance's
+      # image.oci.revision (`incus config get relay-1 image.oci.revision`).
+      version_cmd: [sha256sum, /usr/local/bin/buzz-relay]
     restart: unless-stopped
     environment:
       # Upstream delivers most of these via `env_file: .env`, which injects

@@ -329,10 +329,12 @@ Confirm the migrations actually ran (rather than the relay booting against an em
 incus-compose exec postgres -- psql -U buzz -d buzz -c '\dt'
 ```
 
-Check the pinned image is the one running:
+Check the pinned image is the one running. `buzz-relay` has no `--version`
+flag; it ignores it and boots a second relay inside the container, so read the
+commit from the instance config instead:
 
 ```
-incus-compose exec relay -- buzz-relay --version
+incus config get --project buzz relay-1 image.oci.revision
 ```
 
 ## Connecting an agent
